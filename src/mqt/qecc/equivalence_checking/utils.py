@@ -9,8 +9,11 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from functools import reduce
 from typing import TYPE_CHECKING, overload
 
+import networkx as nx
 import numpy as np
 import z3
 
@@ -23,6 +26,21 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
     import numpy.typing as npt
+
+
+# ----------------------------------------------------------------------------------------------------
+#   Invariants
+# ----------------------------------------------------------------------------------------------------
+
+
+def _preserved_n(c1: StabilizerCode, c2: StabilizerCode) -> bool:
+    """Check the number-of-qubits invariant."""
+    return c1.n == c2.n
+
+
+def _preserved_k(c1: StabilizerCode, c2: StabilizerCode) -> bool:
+    """Check the number-of-logical-qubits invariant."""
+    return c1.k == c2.k
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -42,14 +60,6 @@ def _exactly_one(variables: Iterable[z3.BoolRef]) -> z3.BoolRef:
     return z3.PbEq([(variable, 1) for variable in variables], 1)
 
 
-def _xor_list(variables: Iterable[z3.BoolRef]) -> z3.BoolRef:
-    """Return the exclusive-or of an iterable of Boolean variables."""
-    result = z3.BoolVal(False)
-    for variable in variables:
-        result = z3.Xor(result, variable)
-    return result
-
-
 def _encode_row_operations(
     solver: z3.Solver,
     auxiliary_matrix: Sequence[z3.BoolRef],
@@ -66,7 +76,61 @@ def _encode_row_operations(
             contributions = (
                 coefficients[row * rows + source] for source in range(rows) if target_matrix[source, column] == 1
             )
-            solver.add(auxiliary_matrix[row * columns + column] == _xor_list(contributions))
+            solver.add(auxiliary_matrix[row * columns + column] == reduce(z3.Xor, contributions, z3.BoolVal(False)))
+
+
+def _colored_graph_isomorphism(
+    graph1: nx.Graph, graph2: nx.Graph, *, edge_colors: bool = False
+) -> dict[int, int] | None:
+    """Find an isomorphism that preserves the ``color`` attribute of nodes and, optionally, edges.
+
+    The graphs have to be either both simple graphs or both multigraphs. In multigraphs,
+    the colors of the parallel edges between two nodes have to be preserved as a set.
+
+    The node colors are first refined with the Weisfeiler-Lehman procedure. Differing refinements
+    refute an isomorphism, while matching ones prune the search of the VF2 matcher, which otherwise
+    backtracks heavily on the highly symmetric incidence graphs of codes.
+    Both graphs are annotated with the refinement as ``refined_color`` node attribute.
+
+    Returns:
+        The node mapping from ``graph1`` to ``graph2``, or ``None`` if the graphs are not isomorphic.
+    """
+    for graph in (graph1, graph2):
+        # the Weisfeiler-Lehman procedure of networkx does not support multigraphs
+        hashes = nx.weisfeiler_lehman_subgraph_hashes(
+            _merge_parallel_edges(graph) if isinstance(graph, nx.MultiGraph) else graph,
+            node_attr="color",
+            edge_attr="color" if edge_colors else None,
+        )
+        nx.set_node_attributes(graph, {node: node_hashes[-1] for node, node_hashes in hashes.items()}, "refined_color")
+
+    if Counter(nx.get_node_attributes(graph1, "refined_color").values()) != Counter(
+        nx.get_node_attributes(graph2, "refined_color").values()
+    ):
+        return None
+
+    isomorphism = nx.algorithms.isomorphism
+    categorical_edge_match = (
+        isomorphism.categorical_multiedge_match if graph1.is_multigraph() else isomorphism.categorical_edge_match
+    )
+    matcher = isomorphism.GraphMatcher(
+        graph1,
+        graph2,
+        node_match=isomorphism.categorical_node_match(["color", "refined_color"], [None, None]),
+        edge_match=categorical_edge_match("color", None) if edge_colors else None,
+    )
+    return matcher.mapping if matcher.is_isomorphic() else None
+
+
+def _merge_parallel_edges(graph: nx.MultiGraph) -> nx.Graph:
+    """Merge parallel edges into single edges that are colored by the sorted colors of the merged edges."""
+    merged = nx.Graph()
+    merged.add_nodes_from(graph.nodes(data=True))
+    for node, neighbors in graph.adjacency():
+        for neighbor, parallel_edges in neighbors.items():
+            colors = sorted(str(data.get("color")) for data in parallel_edges.values())
+            merged.add_edge(node, neighbor, color=tuple(colors))
+    return merged
 
 
 @overload

@@ -9,22 +9,51 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pytest
 
 from mqt.qecc import StabilizerCode, are_local_clifford_equivalent, is_local_clifford_equivalent_to_css
 from mqt.qecc.codes import RotatedSurfaceCode
-from mqt.qecc.equivalence_checking._cliffords import _canonicalize_clifford  # ruff: ignore[import-private-name]
+from mqt.qecc.equivalence_checking import local_clifford_equivalence
 from mqt.qecc.equivalence_checking.local_clifford_equivalence import (
     CLIFFORD_ACTIONS,
     LOCAL_CLIFFORDS,
+    _graph_from_stabilizer_group,  # ruff: ignore[import-private-name]
+    _graph_isomorphism_stabilizer_code,  # ruff: ignore[import-private-name]
     _locally_equivalent_connected_graphs,  # ruff: ignore[import-private-name]
+    _lse_stabilizer_code,  # ruff: ignore[import-private-name]
+    _preserved_d,  # ruff: ignore[import-private-name]
     _preserved_low_degree_local_invariant,  # ruff: ignore[import-private-name]
     _stabilizer_code_to_state,  # ruff: ignore[import-private-name]
     _stabilizer_state_to_graph_state,  # ruff: ignore[import-private-name]
 )
+from mqt.qecc.equivalence_checking.utils import (
+    _preserved_k,  # ruff: ignore[import-private-name]
+    _preserved_n,  # ruff: ignore[import-private-name]
+)
 
 from .conftest import assert_same_row_space
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+    from types import ModuleType
+
+# The stages of the pipeline that follow the cheap invariants.
+STAGES = {
+    "low-degree": "_preserved_low_degree_local_invariant",
+    "lse": "_lse_stabilizer_code",
+    "graph-isomorphism": "_graph_isomorphism_stabilizer_code",
+    "sat": "_sat_stabilizer_code",
+}
+
+
+@pytest.fixture
+def stages(trace_stages: Callable[[ModuleType, Mapping[str, str]], list[str]]) -> list[str]:
+    """Record the stages that the LC-equivalence pipeline runs."""
+    return trace_stages(local_clifford_equivalence, STAGES)
+
 
 # ----------------------------------------------------------------------------------------------------
 # Helpers
@@ -46,6 +75,20 @@ def _apply_lc_witness(symplectic: np.ndarray, witness: list[str]) -> np.ndarray:
         transformed[:, qubit + n] = (matrix[1, 0] * x_column + matrix[1, 1] * z_column) % 2
 
     return transformed
+
+
+def _zz_chain(n: int, num_generators: int) -> list[str]:
+    return ["".join("Z" if qubit in {i, i + 1} else "I" for qubit in range(n)) for i in range(num_generators)]
+
+
+def _graph_state(n: int, edges: set[tuple[int, int]]) -> list[str]:
+    return [
+        "".join(
+            "X" if qubit == vertex else "Z" if (min(qubit, vertex), max(qubit, vertex)) in edges else "I"
+            for qubit in range(n)
+        )
+        for vertex in range(n)
+    ]
 
 
 def _assert_maps_rowspace(
@@ -130,6 +173,18 @@ def test_graph_lc_positive() -> None:
     assert _locally_equivalent_connected_graphs(star, complete) is not None
 
 
+def test_graph_lc_order_three_cliffords() -> None:
+    """Test that the operations between two locally equivalent graphs are not inverted."""
+    path = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=np.int8)
+    triangle = np.ones((3, 3), dtype=np.int8) ^ np.eye(3, dtype=np.int8)
+    identity = np.eye(3, dtype=np.int8)
+
+    operations = _locally_equivalent_connected_graphs(path, triangle)
+
+    assert operations is not None
+    assert_same_row_space(_apply_lc_witness(np.hstack([identity, path]), operations), np.hstack([identity, triangle]))
+
+
 def test_graph_lc_negative() -> None:
     """Test that the path and star graphs are not locally equivalent."""
     path = np.array(
@@ -144,10 +199,15 @@ def test_graph_lc_negative() -> None:
     assert _locally_equivalent_connected_graphs(path, star) is None
 
 
-def test_invalid_clifford() -> None:
-    """Test that Clifford words with unsupported gates are rejected."""
-    with pytest.raises(ValueError, match="Unknown Clifford gate 'X'"):
-        _canonicalize_clifford("HX")
+def test_stabilizer_group_graph() -> None:
+    """Test the colored incidence graph of a stabilizer group with two elements."""
+    graph = _graph_from_stabilizer_group(StabilizerCode(["XYZI"]).symplectic)
+
+    # vertices 12 and 13 are the identity and the generator, vertices 0, 5, and 7 are X_0, Y_1, and Z_2
+    assert set(graph.nodes) == set(range(14))
+    assert set(graph.edges) == {(0, 13), (5, 13), (7, 13)}
+    assert [graph.nodes[vertex]["color"] for vertex in range(12)] == [("qubit", vertex // 3) for vertex in range(12)]
+    assert graph.nodes[12]["color"] == graph.nodes[13]["color"] == ("stabilizer",)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -155,121 +215,53 @@ def test_invalid_clifford() -> None:
 # ----------------------------------------------------------------------------------------------------
 
 
-def test_preserves_n() -> None:
-    """Test that LC equivalence preserves the number of physical qubits."""
-    assert are_local_clifford_equivalent(StabilizerCode.get_trivial_code(3), StabilizerCode.get_trivial_code(4)) is None
-
-
-def test_preserves_k() -> None:
-    """Test that LC equivalence preserves the number of logical qubits."""
-    code1 = StabilizerCode.get_trivial_code(3)
-    code2 = StabilizerCode(["ZII"])
+@pytest.mark.parametrize(
+    ("violated", "code1", "code2"),
+    [
+        pytest.param(_preserved_n, StabilizerCode.get_trivial_code(3), StabilizerCode.get_trivial_code(4), id="n"),
+        pytest.param(_preserved_k, StabilizerCode.get_trivial_code(3), StabilizerCode(["ZII"]), id="k"),
+        pytest.param(_preserved_d, StabilizerCode(["ZZ"], distance=1), StabilizerCode(["ZZ"], distance=2), id="d"),
+    ],
+)
+def test_cheap_invariants(
+    violated: Callable[[StabilizerCode, StabilizerCode], bool],
+    code1: StabilizerCode,
+    code2: StabilizerCode,
+    stages: list[str],
+) -> None:
+    """Test that a violated cheap invariant rules out equivalence before any other stage runs."""
+    assert not violated(code1, code2)
 
     assert are_local_clifford_equivalent(code1, code2) is None
+    assert stages == []
+
+
+def test_trivial_code(stages: list[str]) -> None:
+    """Test that a trivial stabilizer code returns the identity witness without running any stage."""
+    code = StabilizerCode.get_trivial_code(3)
+
+    assert are_local_clifford_equivalent(code, code) == ["I", "I", "I"]
+    assert stages == []
 
 
 @pytest.mark.parametrize(
-    ("code1", "code2", "expected"),
+    ("code1", "code2"),
     [
-        pytest.param(StabilizerCode(["Z"]), StabilizerCode(["X"]), True, id="one-qubit-z-vs-x"),
-        pytest.param(StabilizerCode(["Z"]), StabilizerCode(["Y"]), True, id="one-qubit-z-vs-y"),
-        pytest.param(
-            StabilizerCode(["ZI", "IZ"]),
-            StabilizerCode(["XI", "IX"]),
-            True,
-            id="two-product-bases",
-        ),
-        pytest.param(
-            StabilizerCode(["ZI", "IZ"]),
-            StabilizerCode(["XX", "ZZ"]),
-            False,
-            id="product-vs-bell-state",
-        ),
-        pytest.param(
-            StabilizerCode(["ZZ"], z_logicals=["ZI"], x_logicals=["XX"]),
-            StabilizerCode(["XX"], z_logicals=["XI"], x_logicals=["ZZ"]),
-            True,
-            id="repetition-code-under-hadamards",
-        ),
+        pytest.param(StabilizerCode(["ZI", "IZ"]), StabilizerCode(["XX", "ZZ"]), id="product-vs-bell-state"),
         pytest.param(
             StabilizerCode(["ZZ"], z_logicals=["ZI"], x_logicals=["XX"]),
             StabilizerCode(["ZI"], z_logicals=["IZ"], x_logicals=["IX"]),
-            False,
             id="weight-two-vs-weight-one-stabilizer",
         ),
-        pytest.param(
-            StabilizerCode(["ZIYX", "ZIII"]),
-            StabilizerCode(["IIYZ", "XIYZ"]),
-            True,
-            id="four-qubit-mixed-code",
-        ),
+        pytest.param(StabilizerCode(["ZZII", "IIZZ"]), StabilizerCode(["ZZZZ", "XXII"]), id="two-logical-qubits"),
     ],
 )
-def test_hardcoded_cases(
-    code1: StabilizerCode,
-    code2: StabilizerCode,
-    expected: bool,
-) -> None:
-    """Test LC equivalence for small stabilizer-code pairs with known outcomes."""
-    witness = are_local_clifford_equivalent(code1, code2)
-
-    assert (witness is not None) is expected
-    if witness is not None:
-        _assert_maps_rowspace(code1, code2, witness)
-
-
-def test_hadamard_witness() -> None:
-    """Test that a one-qubit basis change returns a Hadamard witness."""
-    witness = are_local_clifford_equivalent(StabilizerCode(["Z"]), StabilizerCode(["X"]))
-
-    assert witness == ["H"]
-
-
-def test_two_hadamard_witness() -> None:
-    """Test that two product-basis changes return two Hadamards."""
-    witness = are_local_clifford_equivalent(StabilizerCode(["ZI", "IZ"]), StabilizerCode(["XI", "IX"]))
-
-    assert witness == ["H", "H"]
-
-
-def test_sat_positive() -> None:
-    """Test that the stabilizer SAT backend finds an LC witness."""
-    code1 = StabilizerCode(["ZZII", "IIZZ"])
-    code2 = StabilizerCode(["XXII", "IIXX"])
-
-    assert code1.k == 2
-
-    witness = are_local_clifford_equivalent(code1, code2)
-
-    assert witness is not None
-    _assert_maps_rowspace(code1, code2, witness)
-
-
-def test_sat_negative() -> None:
-    """Test that the stabilizer SAT backend rejects an inequivalent pair."""
-    code1 = StabilizerCode(["YYZYZ", "IXIIX", "ZXZXX"])
-    code2 = StabilizerCode(["XIZIY", "XXZII", "IYXIZ"])
-
-    assert code1.k == 2
-    assert code1.n == code2.n
-    assert code1.k == code2.k
-    assert code1.distance == code2.distance
-
-    assert are_local_clifford_equivalent(code1, code2) is None
-
-
-def test_low_degree_rejection() -> None:
-    """Test that the low-degree local invariant rejects an inequivalent pair."""
-    code1 = StabilizerCode(["ZZII", "IIZZ"])
-    code2 = StabilizerCode(["ZZZZ", "XXII"])
-
-    assert code1.n == code2.n
-    assert code1.k == code2.k == 2
-    assert code1.distance == code2.distance
-
+def test_low_degree_rejection(code1: StabilizerCode, code2: StabilizerCode, stages: list[str]) -> None:
+    """Test that the low-degree local invariant rejects an inequivalent pair of small codes."""
     assert not _preserved_low_degree_local_invariant(code1, code2)
 
     assert are_local_clifford_equivalent(code1, code2) is None
+    assert stages == ["low-degree"]
 
 
 def test_low_degree_basis_change() -> None:
@@ -280,62 +272,221 @@ def test_low_degree_basis_change() -> None:
     assert _preserved_low_degree_local_invariant(code1, code2)
 
 
-def test_s_and_hsh_witness() -> None:
-    """Test that the LSE backend extracts S and HSH operations."""
-    code1 = StabilizerCode(["XY"])
-    code2 = StabilizerCode(["YZ"])
+@pytest.mark.parametrize(
+    ("code1", "code2", "expected_witness"),
+    [
+        pytest.param(StabilizerCode(["Z"]), StabilizerCode(["Z"]), ["I"], id="one-qubit-identity"),
+        pytest.param(StabilizerCode(["Z"]), StabilizerCode(["X"]), ["H"], id="one-qubit-z-vs-x"),
+        pytest.param(StabilizerCode(["Z"]), StabilizerCode(["Y"]), None, id="one-qubit-z-vs-y"),
+        pytest.param(StabilizerCode(["ZI", "IZ"]), StabilizerCode(["XI", "IX"]), ["H", "H"], id="two-product-bases"),
+        pytest.param(StabilizerCode(["XY"]), StabilizerCode(["YZ"]), ["S", "HSH"], id="s-and-hsh"),
+        pytest.param(StabilizerCode(["YY"]), StabilizerCode(["ZY"]), None, id="order-three-clifford"),
+        pytest.param(StabilizerCode(["ZZ"]), StabilizerCode(["ZZ", "ZZ"]), None, id="redundant-generators"),
+        pytest.param(
+            StabilizerCode(["ZZ"], z_logicals=["ZI"], x_logicals=["XX"]),
+            StabilizerCode(["XX"], z_logicals=["XI"], x_logicals=["ZZ"]),
+            None,
+            id="repetition-code-under-hadamards",
+        ),
+        pytest.param(
+            StabilizerCode(["XZZZ", "ZXZZ", "ZZXZ", "ZZZX"]),
+            StabilizerCode(["XZZZ", "ZXZZ", "ZZXZ", "ZZZX"]),
+            None,
+            id="solution-space-of-dimension-greater-than-four",
+        ),
+    ],
+)
+def test_lse_positive(
+    code1: StabilizerCode, code2: StabilizerCode, expected_witness: list[str] | None, stages: list[str]
+) -> None:
+    """Test that the LSE backend finds an LC witness for codes with at most one logical qubit."""
+    witness = are_local_clifford_equivalent(code1, code2)
+
+    assert witness is not None
+    _assert_maps_rowspace(code1, code2, witness)
+    if expected_witness is not None:
+        assert witness == expected_witness
+    assert stages == ["low-degree", "lse"]
+
+
+def test_lse_positive_larger_codes(stages: list[str]) -> None:
+    """Test that the LSE backend finds an LC witness for larger graph states without checking an invariant."""
+    n = 11
+    star = StabilizerCode(_graph_state(n, {(0, vertex) for vertex in range(1, n)}))
+    complete = StabilizerCode(_graph_state(n, {(u, v) for u in range(n) for v in range(u + 1, n)}))
+
+    witness = are_local_clifford_equivalent(star, complete)
+
+    assert witness is not None
+    _assert_maps_rowspace(star, complete, witness)
+    assert stages == ["lse"]
+
+
+def test_lse_negative(stages: list[str]) -> None:
+    """Test that the LSE backend rejects an inequivalent pair that preserves the low-degree local invariant."""
+    code1 = StabilizerCode(["YXIYZX", "XXYXZI", "ZZZIXZ", "XIZZZI", "IIZXXI", "IXIIIX"])
+    code2 = StabilizerCode(["YYYIZZ", "YZIZYZ", "ZZYIYX", "XXYZII", "ZZZXZX", "IYYYXX"])
+
+    assert are_local_clifford_equivalent(code1, code2) is None
+    assert stages == ["low-degree", "lse"]
+
+
+def test_lse_negative_larger_codes(stages: list[str]) -> None:
+    """Test that the LSE backend rejects graph states from different LC orbits without checking an invariant."""
+    n = 11
+    path = StabilizerCode(_graph_state(n, {(vertex, vertex + 1) for vertex in range(n - 1)}))
+    star = StabilizerCode(_graph_state(n, {(0, vertex) for vertex in range(1, n)}))
+
+    assert are_local_clifford_equivalent(path, star) is None
+    assert stages == ["lse"]
+
+
+def test_lse_connected_components() -> None:
+    """Test that the LSE backend rejects graph states with different connected components."""
+    product_state = StabilizerCode(["ZI", "IZ"])
+    bell_state = StabilizerCode(["XX", "ZZ"])
+
+    assert _lse_stabilizer_code(product_state, bell_state) is None
+
+
+@pytest.mark.parametrize(
+    ("code1", "code2", "expected_stages"),
+    [
+        pytest.param(
+            StabilizerCode(["ZZII", "IIZZ"]),
+            StabilizerCode(["XXII", "IIXX"]),
+            ["low-degree", "graph-isomorphism"],
+            id="two-repetition-codes",
+        ),
+        pytest.param(
+            StabilizerCode(["ZIYX", "ZIII"]),
+            StabilizerCode(["IIYZ", "XIYZ"]),
+            ["low-degree", "graph-isomorphism"],
+            id="four-qubit-mixed-code",
+        ),
+        pytest.param(
+            StabilizerCode(_zz_chain(11, 7)),
+            StabilizerCode([generator.replace("Z", "Y") for generator in _zz_chain(11, 7)]),
+            ["graph-isomorphism"],
+            id="most-generators-without-invariant",
+        ),
+    ],
+)
+def test_graph_isomorphism_positive(
+    code1: StabilizerCode, code2: StabilizerCode, expected_stages: list[str], stages: list[str]
+) -> None:
+    """Test that the stabilizer graph-isomorphism backend finds an LC witness."""
+    assert code1.k >= 2
 
     witness = are_local_clifford_equivalent(code1, code2)
 
     assert witness is not None
-    assert witness == ["S", "HSH"]
+    _assert_maps_rowspace(code1, code2, witness)
+    assert stages == expected_stages
+
+
+@pytest.mark.parametrize(
+    ("code1", "code2", "expected_stages"),
+    [
+        pytest.param(
+            StabilizerCode(["YIXXZ", "XXIYI", "XIYYY"]),
+            StabilizerCode(["ZYIZY", "YZIYZ", "YIXIZ"]),
+            ["low-degree", "graph-isomorphism"],
+            id="five-qubit-codes",
+        ),
+        pytest.param(
+            StabilizerCode(_zz_chain(11, 7)),
+            StabilizerCode([*_zz_chain(11, 6), "IIIIIIIIIZZ"]),
+            ["graph-isomorphism"],
+            id="without-invariant",
+        ),
+    ],
+)
+def test_graph_isomorphism_negative(
+    code1: StabilizerCode, code2: StabilizerCode, expected_stages: list[str], stages: list[str]
+) -> None:
+    """Test that the stabilizer graph-isomorphism backend rejects an inequivalent pair."""
+    assert code1.k >= 2
+
+    assert are_local_clifford_equivalent(code1, code2) is None
+    assert stages == expected_stages
+
+
+@pytest.mark.parametrize("operation", LOCAL_CLIFFORDS)
+def test_graph_isomorphism_witness(operation: str) -> None:
+    """Test that the stabilizer graph-isomorphism backend extracts a valid witness for every local Clifford."""
+    code1 = StabilizerCode(["XZYI", "IYXZ"])
+    transformed = _apply_lc_witness(code1.symplectic, [operation] * code1.n)
+    paulis = transformed[:, : code1.n] + 2 * transformed[:, code1.n :]
+    code2 = StabilizerCode(["".join("IXZY"[pauli] for pauli in row) for row in paulis])
+
+    witness = _graph_isomorphism_stabilizer_code(code1, code2)
+
+    assert witness is not None
     _assert_maps_rowspace(code1, code2, witness)
 
 
-def test_large_lse_nullspace() -> None:
-    """Test the LSE branch for solution spaces of dimension greater than four."""
-    code = StabilizerCode(["XZZZ", "ZXZZ", "ZZXZ", "ZZZX"])
+@pytest.mark.parametrize(
+    ("n", "expected_stages"),
+    [pytest.param(10, ["low-degree", "sat"], id="with-invariant"), pytest.param(11, ["sat"], id="without-invariant")],
+)
+def test_sat_positive(n: int, expected_stages: list[str], stages: list[str]) -> None:
+    """Test that the stabilizer SAT backend finds an LC witness for codes with many generators."""
+    code1 = StabilizerCode(_zz_chain(n, 8))
+    code2 = StabilizerCode([generator.replace("Z", "X") for generator in _zz_chain(n, 8)])
 
-    witness = are_local_clifford_equivalent(code, code)
+    assert code1.k >= 2
 
-    assert witness is not None
-    _assert_maps_rowspace(code, code, witness)
-
-
-def test_lse_negative() -> None:
-    """Test that the LSE backend rejects graph states from different LC orbits."""
-    path = StabilizerCode(["XZII", "ZXZI", "IZXZ", "IIZX"])
-    star = StabilizerCode(["XZZZ", "ZXII", "ZIXI", "ZIIX"])
-
-    assert are_local_clifford_equivalent(path, star) is None
-
-
-def test_trivial_code() -> None:
-    """Test that a trivial stabilizer code is LC-equivalent to itself."""
-    code = StabilizerCode.get_trivial_code(3)
-    witness = are_local_clifford_equivalent(code, code)
+    witness = are_local_clifford_equivalent(code1, code2)
 
     assert witness is not None
-    assert len(witness) == code.n
-    _assert_maps_rowspace(code, code, witness)
+    _assert_maps_rowspace(code1, code2, witness)
+    assert stages == expected_stages
 
 
-def test_one_qubit_code() -> None:
-    """Test that a one-qubit code returns the identity witness."""
-    witness = are_local_clifford_equivalent(StabilizerCode(["Z"]), StabilizerCode(["Z"]))
+@pytest.mark.parametrize(
+    ("code1", "code2", "expected_stages"),
+    [
+        pytest.param(
+            StabilizerCode([
+                "YIIIIIZZYZ",
+                "ZYIZYXXZYI",
+                "IIXIIIZIZX",
+                "XIIZIZIZYY",
+                "ZIIZXZIYZX",
+                "IZIXIXIIII",
+                "YIIXIIYXIZ",
+                "ZIIIYXXXXI",
+            ]),
+            StabilizerCode([
+                "ZXXYZZYZYI",
+                "ZYIZIZYIIY",
+                "ZIZYIZZIYI",
+                "IXIXXZYZYI",
+                "IIIYXZZZYI",
+                "XXYZIYIZIZ",
+                "IZIYXZIIIY",
+                "YYXIZIZYYI",
+            ]),
+            ["low-degree", "sat"],
+            id="with-invariant",
+        ),
+        pytest.param(
+            StabilizerCode(_zz_chain(11, 8)),
+            StabilizerCode([*_zz_chain(11, 7), "IIIIIIIIIZZ"]),
+            ["sat"],
+            id="without-invariant",
+        ),
+    ],
+)
+def test_sat_negative(
+    code1: StabilizerCode, code2: StabilizerCode, expected_stages: list[str], stages: list[str]
+) -> None:
+    """Test that the stabilizer SAT backend rejects an inequivalent pair of codes with many generators."""
+    assert code1.k >= 2
 
-    assert witness == ["I"]
-
-
-def test_redundant_generators() -> None:
-    """Test that redundant stabilizer generators do not affect LC equivalence."""
-    code = StabilizerCode(["ZZ"])
-    code_with_redundancy = StabilizerCode(["ZZ", "ZZ"])
-
-    witness = are_local_clifford_equivalent(code, code_with_redundancy)
-
-    assert witness is not None
-    _assert_maps_rowspace(code, code_with_redundancy, witness)
+    assert are_local_clifford_equivalent(code1, code2) is None
+    assert stages == expected_stages
 
 
 # ----------------------------------------------------------------------------------------------------

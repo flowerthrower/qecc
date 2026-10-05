@@ -19,10 +19,18 @@ import numpy as np
 import z3
 
 from ..codes.core.css_code import CSSCode
-from ..mod2 import nullspace, rank, row_basis
+from ..mod2 import nullspace, rank, row_basis, row_span
 from ..mod4 import matmul_gf2_gf4
 from ..mod4 import row_basis as gf4_row_basis
-from .utils import _elementwise_map, _encode_row_operations, _exactly_one, _reduce_stabilizer_generators
+from .utils import (
+    _colored_graph_isomorphism,
+    _elementwise_map,
+    _encode_row_operations,
+    _exactly_one,
+    _preserved_k,
+    _preserved_n,
+    _reduce_stabilizer_generators,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
@@ -32,16 +40,27 @@ if TYPE_CHECKING:
     from ..codes.core.stabilizer_code import StabilizerCode
 
 
-# These algorithms are parameter-dependent dispatchers,
-# combining the empirically best-performing algorithms
-# for different code sizes and types, based on these thresholds.
-BRUTEFORCE_THRESHOLD_STB = 5
-BRUTEFORCE_THRESHOLD_CSS = 5
-LINEAR_DEPENDENCY_MIN_QUBITS_CSS = 20
-MATROID_MAX_QUBITS_CSS = 17
-SAT_MIN_QUBITS_CSS = 30
-MATROID_MAX_GENERATORS_CSS = 9
-PUNCTURED_HULL_MAX_QUBITS_STB = 20
+# Each equivalence check runs up to three stages with the following
+# empirically determined parameter thresholds:
+# it tries to refute equivalence with invariants,
+# refines the qubits into classes that any permutation has to preserve,
+# and finally decides equivalence with a complete procedure.
+
+# Refute
+LINEAR_DEPENDENCY_MIN_QUBITS_CSS = 23
+LINEAR_DEPENDENCY_MIN_GENERATORS_CSS = 10
+LINEAR_DEPENDENCY_MIN_QUBITS_STB = 25
+LINEAR_DEPENDENCY_MIN_GENERATORS_STB = 8
+
+# Refine
+PUNCTURED_HULL_MAX_DIMENSION_CSS = 14
+PUNCTURED_HULL_MAX_QUBITS_STB = 25
+PUNCTURED_HULL_MAX_GENERATORS_STB = 14
+
+# Decide
+BRUTEFORCE_MAX_QUBITS_CSS = 5
+MATROID_MAX_QUBITS_CSS = 13
+GRAPH_ISOMORPHISM_MAX_GENERATORS_STB = 7
 
 InvariantT = TypeVar("InvariantT", bound="Hashable")
 _CSSHullSignature = tuple[tuple[int, ...], tuple[int, ...]]
@@ -63,10 +82,12 @@ def are_permutation_equivalent(code1: StabilizerCode | CSSCode, code2: Stabilize
     code1 = _reduce_stabilizer_generators(code1)
     code2 = _reduce_stabilizer_generators(code2)
 
+    # Refute
     cheap_invariants = (
         _preserved_n,
         _preserved_k,
         _preserved_d,
+        _preserved_ranks,
         _preserved_number_zero_columns,
         _preserved_number_duplicate_columns,
     )
@@ -74,71 +95,78 @@ def are_permutation_equivalent(code1: StabilizerCode | CSSCode, code2: Stabilize
     if not all(invariant(code1, code2) for invariant in cheap_invariants):
         return None
 
+    if code1.n == 0 or code1.symplectic.shape[0] == 0:
+        return list(range(code1.n))
+
     if isinstance(code1, CSSCode) and isinstance(code2, CSSCode):
         return _permutation_eq_css_codes(code1, code2)
     return _permutation_eq_stabilizer_codes(code1, code2)
 
 
 def _permutation_eq_css_codes(code1: CSSCode, code2: CSSCode) -> list[int] | None:
-    """Check whether two CSS codes are permutation equivalent.
+    """Check whether two non-trivial CSS codes with matching cheap invariants are permutation equivalent.
 
-    Employs a combination of brute-force, matroid, and SAT-based algorithms depending on the size of the codes.
-    Uses a qubit signature to partition the qubits into equivalence classes, which reduces the permutation search space.
+    Refutes equivalence of larger codes with a linear-dependency invariant, refines the qubits into classes
+    using a qubit signature, and decides equivalence with a brute-force, matroid, or SAT-based algorithm
+    depending on the size of the codes.
+
+    Note: Due to a different graph isomorphism tool (pynauty vs. networkx), the empirical threshold between the matroid and SAT-based algorithms differs between the paper and MQT version.
     """
-    if code1.Hx.shape[0] != code2.Hx.shape[0] or code1.Hz.shape[0] != code2.Hz.shape[0]:
+    n = code1.n
+    r = code1.Hx.shape[0] + code1.Hz.shape[0]
+
+    # Refute
+    if (
+        n >= LINEAR_DEPENDENCY_MIN_QUBITS_CSS
+        and r >= LINEAR_DEPENDENCY_MIN_GENERATORS_CSS
+        and not _preserved_linear_dependencies(code1, code2)
+    ):
         return None
 
-    if code1.Hx.shape[0] + code1.Hz.shape[0] == 0 or code1.n == 0:
-        return list(range(code1.n))
-
-    if code1.n <= BRUTEFORCE_THRESHOLD_CSS:
-        return _bruteforce_css(code1, code2)
-
-    if code1.n >= LINEAR_DEPENDENCY_MIN_QUBITS_CSS and not _preserved_linear_dependencies(code1, code2):
-        return None
-
+    # Refine
     partitions = _preserved_punctured_hull_weight_enumerator_css_code(code1, code2)
     if partitions is None:
         return None
     partition1, partition2 = partitions
 
-    if code1.n <= MATROID_MAX_QUBITS_CSS:
+    # Decide
+    if n <= BRUTEFORCE_MAX_QUBITS_CSS:
+        return _bruteforce_css(code1, code2)
+    if n <= MATROID_MAX_QUBITS_CSS:
         return _matroid_css_code(code1, partition1, code2, partition2)
-    if code1.n < SAT_MIN_QUBITS_CSS:
-        r = code1.Hx.shape[0] + code1.Hz.shape[0]
-        return (
-            _matroid_css_code(code1, partition1, code2, partition2)
-            if r <= MATROID_MAX_GENERATORS_CSS
-            else _sat_css_code(code1, partition1, code2, partition2)
-        )
     return _sat_css_code(code1, partition1, code2, partition2)
 
 
 def _permutation_eq_stabilizer_codes(code1: StabilizerCode, code2: StabilizerCode) -> list[int] | None:
-    """Check whether two stabilizer codes are permutation equivalent.
+    """Check whether two non-trivial stabilizer codes with matching cheap invariants are permutation equivalent.
 
-    Employs a combination of brute-force and SAT-based algorithms depending on the size of the codes.
-    For medium-sized codes, uses a qubit signature to partition the qubits into equivalence classes, which reduces the permutation search space.
+    Refutes equivalence of larger codes with a linear-dependency invariant, refines the qubits of smaller codes
+    into classes using a qubit signature, and decides equivalence with a graph-isomorphism or SAT-based algorithm
+    depending on the number of stabilizer generators.
     """
-    if code1.symplectic.shape[0] != code2.symplectic.shape[0]:
+    n = code1.n
+    r = code1.symplectic.shape[0]
+
+    # Refute
+    if (
+        n >= LINEAR_DEPENDENCY_MIN_QUBITS_STB
+        and r >= LINEAR_DEPENDENCY_MIN_GENERATORS_STB
+        and not _preserved_linear_dependencies(code1, code2)
+    ):
         return None
 
-    if code1.symplectic.shape[0] == 0 or code1.n == 0:
-        return list(range(code1.n))
-
-    if code1.n <= BRUTEFORCE_THRESHOLD_STB:
-        return _bruteforce_stb(code1, code2)
-
-    if not _preserved_linear_dependencies(code1, code2):
-        return None
-
-    partition1 = {(): list(range(code1.n))}
-    partition2 = {(): list(range(code2.n))}
-    if code1.n <= PUNCTURED_HULL_MAX_QUBITS_STB:
+    # Refine
+    partition1: dict[tuple[int, ...], list[int]] = {(): list(range(n))}
+    partition2 = partition1
+    if n <= PUNCTURED_HULL_MAX_QUBITS_STB and r <= PUNCTURED_HULL_MAX_GENERATORS_STB:
         refined_partitions = _preserved_punctured_hull_weight_enumerator_stabilizer_code(code1, code2)
         if refined_partitions is None:
             return None
         partition1, partition2 = refined_partitions
+
+    # Decide
+    if r <= GRAPH_ISOMORPHISM_MAX_GENERATORS_STB:
+        return _graph_isomorphism_stabilizer_code(code1, partition1, code2, partition2)
     return _sat_stabilizer_code(code1, partition1, code2, partition2)
 
 
@@ -147,21 +175,20 @@ def _permutation_eq_stabilizer_codes(code1: StabilizerCode, code2: StabilizerCod
 # ----------------------------------------------------------------------------------------------------
 
 
-def _preserved_n(c1: StabilizerCode | CSSCode, c2: StabilizerCode | CSSCode) -> bool:
-    """Check the number-of-qubits invariant for permutation equivalence."""
-    return c1.n == c2.n
-
-
-def _preserved_k(c1: StabilizerCode | CSSCode, c2: StabilizerCode | CSSCode) -> bool:
-    """Check the number-of-logical-qubits invariant for permutation equivalence."""
-    return c1.k == c2.k
-
-
 def _preserved_d(c1: StabilizerCode | CSSCode, c2: StabilizerCode | CSSCode) -> bool:
     """Check the code-distance invariant for permutation equivalence."""
     if isinstance(c1, CSSCode) and isinstance(c2, CSSCode):
         return c1.x_distance == c2.x_distance and c1.z_distance == c2.z_distance
     return c1.distance == c2.distance
+
+
+def _preserved_ranks(c1: StabilizerCode | CSSCode, c2: StabilizerCode | CSSCode) -> bool:
+    """Check the X-part and Z-part rank invariant for permutation equivalence."""
+
+    def _ranks(c: StabilizerCode | CSSCode) -> tuple[int, int]:
+        return rank(c.symplectic[:, : c.n]), rank(c.symplectic[:, c.n :])
+
+    return _ranks(c1) == _ranks(c2)
 
 
 def _preserved_number_zero_columns(c1: StabilizerCode | CSSCode, c2: StabilizerCode | CSSCode) -> bool:
@@ -216,33 +243,16 @@ def _preserved_punctured_hull_weight_enumerator_css_code(
     This invariant is based on Sendrier's support splitting algorithm:
     https://doi.org/10.1109/18.850662.
     """
-    n = c1.n
 
-    def _generator_matrix_from_parity_check(
-        parity_check: npt.NDArray[np.integer],
-    ) -> npt.NDArray[np.integer]:
-        if parity_check.size == 0 or parity_check.shape[0] == 0:
-            return np.eye(n, dtype=np.uint8)
-        return nullspace(parity_check)
-
-    def _combined_signature(
-        gx: npt.NDArray[np.integer], gz: npt.NDArray[np.integer]
-    ) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
-        return list(
-            zip(
-                _punctured_hull_weight_enumerators(_binary_punctured_hull_bases(gx), lambda word: int(word.sum())),
-                _punctured_hull_weight_enumerators(_binary_punctured_hull_bases(gz), lambda word: int(word.sum())),
-                strict=True,
-            )
+    def _signatures(parity_check: npt.NDArray[np.integer]) -> list[tuple[int, ...]]:
+        return _punctured_hull_weight_enumerators(
+            _binary_punctured_hull_bases(nullspace(parity_check)),
+            lambda word: int(word.sum()),
+            max_dimension=PUNCTURED_HULL_MAX_DIMENSION_CSS,
         )
 
-    gx1 = _generator_matrix_from_parity_check(c1.Hx)
-    gz1 = _generator_matrix_from_parity_check(c1.Hz)
-    gx2 = _generator_matrix_from_parity_check(c2.Hx)
-    gz2 = _generator_matrix_from_parity_check(c2.Hz)
-
-    signatures_c1 = _combined_signature(gx1, gz1)
-    signatures_c2 = _combined_signature(gx2, gz2)
+    signatures_c1 = list(zip(_signatures(c1.Hx), _signatures(c1.Hz), strict=True))
+    signatures_c2 = list(zip(_signatures(c2.Hx), _signatures(c2.Hz), strict=True))
 
     return _matching_invariant_partitions(signatures_c1, signatures_c2)
 
@@ -287,17 +297,23 @@ def _bruteforce_css(c1: CSSCode, c2: CSSCode) -> list[int] | None:
     return None
 
 
-def _bruteforce_stb(c1: StabilizerCode, c2: StabilizerCode) -> list[int] | None:
-    """Brute-force check for permutation equivalence of two stabilizer codes."""
-    c1_rank = c1.symplectic.shape[0]
+def _graph_isomorphism_stabilizer_code(
+    c1: StabilizerCode,
+    partition1: Mapping[InvariantT, Sequence[int]],
+    c2: StabilizerCode,
+    partition2: Mapping[InvariantT, Sequence[int]],
+) -> list[int] | None:
+    """Check permutation equivalence of stabilizer codes through an isomorphism of the full-group graph encodings."""
+    mapping = _colored_graph_isomorphism(
+        _graph_from_stabilizer_group_and_invariants(c1.symplectic, partition1),
+        _graph_from_stabilizer_group_and_invariants(c2.symplectic, partition2),
+        edge_colors=True,
+    )
 
-    for perm in permutations(range(c1.n)):
-        perm_symplectic = perm + tuple(q + c1.n for q in perm)
+    if mapping is None:
+        return None
 
-        if c1_rank == rank(np.vstack([c1.symplectic, c2.symplectic[:, perm_symplectic]])):
-            return list(perm)
-
-    return None
+    return [mapping[q] for q in range(c1.n)]
 
 
 def _sat_stabilizer_code(
@@ -368,7 +384,7 @@ def _matroid_css_code(
     c2: CSSCode,
     partition2: Mapping[InvariantT, Sequence[int]],
 ) -> list[int] | None:
-    """Check CSS-code permutation equivalence through matroid isomorphism."""
+    """Check permutation equivalence of CSS codes through an isomorphism of the matroid-circuit graph encodings."""
     n = c1.n
 
     circuits_c1_hx = _circuits_binary_matroid(c1.Hx)
@@ -396,14 +412,11 @@ def _matroid_css_code(
     del circuits_c2_hx
     del circuits_c2_hz
 
-    matcher = nx.algorithms.isomorphism.GraphMatcher(
-        graph_c1, graph_c2, node_match=lambda a, b: a["color"] == b["color"]
-    )
+    mapping = _colored_graph_isomorphism(graph_c1, graph_c2)
 
-    if not matcher.is_isomorphic():
+    if mapping is None:
         return None
 
-    mapping = matcher.mapping
     return [mapping[q] for q in range(n)]
 
 
@@ -426,9 +439,6 @@ def _circuits_binary_matroid(matrix: npt.NDArray[np.integer]) -> list[int]:
         changed = gray ^ previous_gray
         support ^= row_supports[changed.bit_length() - 1]
         previous_gray = gray
-
-        if not support:
-            continue
 
         support_size = support.bit_count()
         if any(
@@ -461,14 +471,7 @@ def _graph_from_circuits_and_invariants(
 
     graph = nx.Graph()
     graph.add_nodes_from(range(n + n_hx + n_hz))
-
-    qubit_color: dict[int, int] = {}
-    for color, (_, columns) in enumerate(sorted(partition.items())):
-        for column in columns:
-            qubit_color[column] = color
-
-    for qubit in range(n):
-        graph.nodes[qubit]["color"] = ("qubit", qubit_color[qubit])
+    _color_qubits(graph, partition)
 
     for circuits, offset, kind in ((circuits_hx, hx_offset, "hx"), (circuits_hz, hz_offset, "hz")):
         for index, circuit in enumerate(circuits):
@@ -483,6 +486,36 @@ def _graph_from_circuits_and_invariants(
     return graph
 
 
+def _graph_from_stabilizer_group_and_invariants(
+    symplectic: npt.NDArray[np.integer],
+    partition: Mapping[InvariantT, Sequence[int]],
+) -> nx.MultiGraph:
+    """Build a colored incidence multigraph of the qubits and the stabilizer group elements."""
+    n = symplectic.shape[1] // 2
+    group = row_span(symplectic)
+
+    graph = nx.MultiGraph()
+    graph.add_nodes_from(range(n))
+    _color_qubits(graph, partition)
+    graph.add_nodes_from(range(n, n + group.shape[0]), color=("stabilizer",))
+
+    for color, part in (("x", group[:, :n]), ("z", group[:, n:])):
+        elements, qubits = np.nonzero(part)
+        graph.add_edges_from(
+            ((qubit, n + element, color) for element, qubit in zip(elements.tolist(), qubits.tolist(), strict=True)),
+            color=color,
+        )
+
+    return graph
+
+
+def _color_qubits(graph: nx.Graph, partition: Mapping[InvariantT, Sequence[int]]) -> None:
+    """Color the qubit vertices of a graph by their class in an invariant partition."""
+    for color, (_, columns) in enumerate(sorted(partition.items())):
+        for column in columns:
+            graph.nodes[column]["color"] = ("qubit", color)
+
+
 def _binary_punctured_hull_bases(
     matrix: npt.NDArray[np.integer],
 ) -> Iterator[npt.NDArray[np.integer]]:
@@ -490,17 +523,7 @@ def _binary_punctured_hull_bases(
     for column in range(matrix.shape[1]):
         punctured = np.delete(matrix, column, axis=1)
         gram = (punctured @ punctured.T) & 1
-
-        if gram.size == 0:
-            yield np.zeros((0, punctured.shape[1]), dtype=np.uint8)
-        elif not gram.any():
-            yield row_basis(punctured).astype(np.uint8)
-        else:
-            coefficients = nullspace(gram)
-            if coefficients.shape[0] == 0:
-                yield np.zeros((0, punctured.shape[1]), dtype=np.uint8)
-            else:
-                yield row_basis((coefficients @ punctured) & 1).astype(np.uint8)
+        yield row_basis((nullspace(gram) @ punctured) & 1).astype(np.uint8)
 
 
 def _quaternary_punctured_hull_bases(
@@ -519,19 +542,25 @@ def _quaternary_punctured_hull_bases(
     for column in range(num_columns):
         punctured = np.delete(matrix, column, axis=1)
         gram = full_gram ^ contributions[column]
-        coefficients = nullspace(gram.T)
-
-        if coefficients.shape[0] == 0:
-            yield np.zeros((0, punctured.shape[1]), dtype=np.uint8)
-        else:
-            yield gf4_row_basis(matmul_gf2_gf4(coefficients, punctured))
+        yield gf4_row_basis(matmul_gf2_gf4(nullspace(gram.T), punctured))
 
 
 def _punctured_hull_weight_enumerators(
-    hull_bases: Iterator[npt.NDArray[np.integer]], weight: Callable[[npt.NDArray[np.integer]], int]
+    hull_bases: Iterator[npt.NDArray[np.integer]],
+    weight: Callable[[npt.NDArray[np.integer]], int],
+    *,
+    max_dimension: int | None = None,
 ) -> list[tuple[int, ...]]:
-    """Compute a weight enumerator for each punctured hull basis."""
-    return [tuple(_gray_code_weight_enumerator(basis, weight)) for basis in hull_bases]
+    """Compute a weight enumerator for each punctured hull basis.
+
+    Hulls exceeding ``max_dimension`` are too large to enumerate and only described by their dimension.
+    """
+    return [
+        (-1, basis.shape[0])
+        if max_dimension is not None and basis.shape[0] > max_dimension
+        else tuple(_gray_code_weight_enumerator(basis, weight))
+        for basis in hull_bases
+    ]
 
 
 def _matching_invariant_partitions(

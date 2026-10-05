@@ -16,15 +16,24 @@ import networkx as nx
 import numpy as np
 import z3
 
-from ..mod2 import nullspace, rank, row_echelon
+from ..mod2 import nullspace, rank, row_echelon, row_span
 from ._cliffords import (
     CLIFFORD_ACTIONS,
+    CLIFFORD_BY_MATRIX,
     LOCAL_CLIFFORDS,
     _apply_local_clifford,
     _canonicalize_clifford,
     _select_column,
 )
-from .utils import _elementwise_map, _encode_row_operations, _exactly_one, _reduce_stabilizer_generators
+from .utils import (
+    _colored_graph_isomorphism,
+    _elementwise_map,
+    _encode_row_operations,
+    _exactly_one,
+    _preserved_k,
+    _preserved_n,
+    _reduce_stabilizer_generators,
+)
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -32,11 +41,17 @@ if TYPE_CHECKING:
     from ..codes.core.stabilizer_code import StabilizerCode
 
 
-# These algorithms are parameter-dependent dispatchers,
-# combining the empirically best-performing algorithms
-# for different code sizes and types, based on these thresholds.
+# Each equivalence check runs up to two stages with the following
+# empirically determined parameter thresholds:
+# it tries to refute equivalence with invariants,
+# and decides equivalence with a complete procedure.
+
+# Refute
+LOW_DEGREE_INVARIANT_MAX_QUBITS = 10
+
+# Decide
 BRUTEFORCE_CSS_MAX_QUBITS = 3
-LOW_DEGREE_INVARIANT_MAX_QUBITS = 30
+GRAPH_ISOMORPHISM_MAX_GENERATORS = 7
 
 
 def are_local_clifford_equivalent(code1: StabilizerCode, code2: StabilizerCode) -> list[str] | None:
@@ -55,6 +70,7 @@ def are_local_clifford_equivalent(code1: StabilizerCode, code2: StabilizerCode) 
     code1 = _reduce_stabilizer_generators(code1)
     code2 = _reduce_stabilizer_generators(code2)
 
+    # Refute
     cheap_invariants = (
         _preserved_n,
         _preserved_k,
@@ -64,12 +80,20 @@ def are_local_clifford_equivalent(code1: StabilizerCode, code2: StabilizerCode) 
     if not all(invariant(code1, code2) for invariant in cheap_invariants):
         return None
 
-    if code1.k < 2:
-        return _lse_stabilizer_code(code1, code2)
+    n = code1.n
+    r = code1.symplectic.shape[0]
 
-    if code1.n <= LOW_DEGREE_INVARIANT_MAX_QUBITS and not _preserved_low_degree_local_invariant(code1, code2):
+    if n == 0 or r == 0:
+        return ["I"] * n
+
+    if n <= LOW_DEGREE_INVARIANT_MAX_QUBITS and not _preserved_low_degree_local_invariant(code1, code2):
         return None
 
+    # Decide
+    if code1.k < 2:
+        return _lse_stabilizer_code(code1, code2)
+    if r <= GRAPH_ISOMORPHISM_MAX_GENERATORS:
+        return _graph_isomorphism_stabilizer_code(code1, code2)
     return _sat_stabilizer_code(code1, code2)
 
 
@@ -95,16 +119,6 @@ def is_local_clifford_equivalent_to_css(code: StabilizerCode) -> bool:
 # ----------------------------------------------------------------------------------------------------
 
 
-def _preserved_n(c1: StabilizerCode, c2: StabilizerCode) -> bool:
-    """Check the number-of-qubits invariant for LC equivalence."""
-    return c1.n == c2.n
-
-
-def _preserved_k(c1: StabilizerCode, c2: StabilizerCode) -> bool:
-    """Check the number-of-logical-qubits invariant for LC equivalence."""
-    return c1.k == c2.k
-
-
 def _preserved_d(c1: StabilizerCode, c2: StabilizerCode) -> bool:
     """Check the code-distance invariant for LC equivalence."""
     return c1.distance == c2.distance
@@ -117,26 +131,13 @@ def _preserved_low_degree_local_invariant(c1: StabilizerCode, c2: StabilizerCode
     https://doi.org/10.1103/PhysRevA.70.032323.
     """
     n = c1.n
-    rk = c1.k
-
-    def _supp_subcode_dim(code: npt.NDArray[np.integer], subset: tuple[int, ...]) -> int:
-        g = np.asarray(code, dtype=np.uint8) & 1
-
-        a = set(subset)
-        outside = [i for i in range(n) if i not in a]
-
-        cols = outside + [i + n for i in outside]
-
-        if not cols:
-            return rk
-
-        restricted = g[:, cols]
-        return rk - rank(restricted)
 
     max_subset_size = 2
     for subset_size in range(max_subset_size + 1):
         for subset in combinations(range(n), subset_size):
-            if _supp_subcode_dim(c1.symplectic, subset) != _supp_subcode_dim(c2.symplectic, subset):
+            outside = [qubit for qubit in range(n) if qubit not in subset]
+            columns = outside + [qubit + n for qubit in outside]
+            if rank(c1.symplectic[:, columns]) != rank(c2.symplectic[:, columns]):
                 return False
 
     return True
@@ -196,6 +197,25 @@ def _lse_stabilizer_code(c1: StabilizerCode, c2: StabilizerCode) -> list[str] | 
         op2[::-1] + equivalence + op1 for op1, equivalence, op2 in zip(lc1, equivalence_operations, lc2, strict=True)
     ]
     return [_canonicalize_clifford(operation) for operation in result[: c1.n]]
+
+
+def _graph_isomorphism_stabilizer_code(c1: StabilizerCode, c2: StabilizerCode) -> list[str] | None:
+    """Check local-Clifford equivalence of stabilizer codes through an isomorphism of the full-group graph encodings."""
+    mapping = _colored_graph_isomorphism(
+        _graph_from_stabilizer_group(c1.symplectic), _graph_from_stabilizer_group(c2.symplectic)
+    )
+
+    if mapping is None:
+        return None
+
+    # The vertices 3q, 3q + 1, and 3q + 2 represent X, Z, and Y on qubit q, i.e., the Paulis with values x + 2z
+    # of 1, 2, and 3. The columns of a Clifford matrix are the (x, z) images of X and Z.
+    operations = []
+    for qubit in range(c1.n):
+        x_image = mapping[3 * qubit] - 3 * qubit + 1
+        z_image = mapping[3 * qubit + 1] - 3 * qubit + 1
+        operations.append(CLIFFORD_BY_MATRIX[(x_image & 1, z_image & 1), (x_image >> 1, z_image >> 1)])
+    return operations
 
 
 def _sat_stabilizer_code(c1: StabilizerCode, c2: StabilizerCode) -> list[str] | None:
@@ -342,40 +362,6 @@ def _stabilizer_state_to_graph_state(
     return adjacency, operations
 
 
-def _satisfies_lc_determinant_constraints(solution: npt.NDArray[np.integer]) -> bool:
-    """Check the single-qubit determinant constraints for an LSE solution."""
-    solution = np.asarray(solution, dtype=np.uint8) % 2
-    n = len(solution) // 4
-    a = solution[:n]
-    b = solution[n : 2 * n]
-    c = solution[2 * n : 3 * n]
-    d = solution[3 * n :]
-    return bool(np.all(((a & d) ^ (b & c)) == 1))
-
-
-def _extract_lc_operations(solution: npt.NDArray[np.integer]) -> list[str] | None:
-    """Decode the local Clifford operations represented by an LSE solution."""
-    n = len(solution) // 4
-    operations = []
-    for qubit in range(n):
-        lse_matrix = (
-            (int(solution[qubit]), int(solution[n + qubit])),
-            (int(solution[2 * n + qubit]), int(solution[3 * n + qubit])),
-        )
-        operation = next(
-            (
-                name
-                for name, action in CLIFFORD_ACTIONS.items()
-                if tuple(zip(*action.matrix, strict=True)) == lse_matrix
-            ),
-            None,
-        )
-        if operation is None:
-            return None
-        operations.append(operation)
-    return operations
-
-
 def _locally_equivalent_connected_graphs(
     graph1: npt.NDArray[np.integer], graph2: npt.NDArray[np.integer]
 ) -> list[str] | None:
@@ -411,15 +397,34 @@ def _locally_equivalent_connected_graphs(
             for coefficients in product([0, 1], repeat=dimension)
         )
 
-    return next(
-        (
-            operations
-            for candidate in candidates
-            if _satisfies_lc_determinant_constraints(candidate)
-            if (operations := _extract_lc_operations(candidate)) is not None
-        ),
-        None,
+    # A candidate (a, b, c, d) maps the columns (x, z) of the first graph state to (dx + cz, bx + az).
+    # It describes local Cliffords if this map is invertible on every qubit.
+    for candidate in candidates:
+        a, b, c, d = candidate.reshape(4, n).tolist()
+        if all((a[qubit] & d[qubit]) ^ (b[qubit] & c[qubit]) for qubit in range(n)):
+            return [CLIFFORD_BY_MATRIX[(d[qubit], c[qubit]), (b[qubit], a[qubit])] for qubit in range(n)]
+
+    return None
+
+
+def _graph_from_stabilizer_group(symplectic: npt.NDArray[np.integer]) -> nx.Graph:
+    """Build a colored incidence graph of the single-qubit Paulis and the stabilizer group elements."""
+    n = symplectic.shape[1] // 2
+    group = row_span(symplectic)
+    paulis = group[:, :n] + 2 * group[:, n:]
+
+    graph = nx.Graph()
+    for qubit in range(n):
+        graph.add_nodes_from(range(3 * qubit, 3 * qubit + 3), color=("qubit", qubit))
+    graph.add_nodes_from(range(3 * n, 3 * n + group.shape[0]), color=("stabilizer",))
+
+    elements, qubits = np.nonzero(paulis)
+    graph.add_edges_from(
+        (3 * qubit + int(paulis[element, qubit]) - 1, 3 * n + element)
+        for element, qubit in zip(elements.tolist(), qubits.tolist(), strict=True)
     )
+
+    return graph
 
 
 def _encode_local_cliffords(

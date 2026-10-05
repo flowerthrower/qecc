@@ -39,6 +39,7 @@ CLIFFORD_ACTIONS = {
     "HSH": CliffordAction(((1, 1), (0, 1)), ("xz", "z"), ("xz", "zero")),
 }
 LOCAL_CLIFFORDS = tuple(CLIFFORD_ACTIONS)
+CLIFFORD_BY_MATRIX = {action.matrix: name for name, action in CLIFFORD_ACTIONS.items()}
 
 
 def _select_column(
@@ -68,14 +69,10 @@ def _canonicalize_clifford(word: str) -> str:
     """Return the canonical representative of a Clifford word."""
     matrix = np.eye(2, dtype=np.uint8)
     for gate in word:
-        if gate not in {"H", "S", "I"}:
-            msg = f"Unknown Clifford gate {gate!r}."
-            raise ValueError(msg)
         matrix = (matrix @ np.asarray(CLIFFORD_ACTIONS[gate].matrix, dtype=np.uint8)) % 2
 
-    matrices = {action.matrix: name for name, action in CLIFFORD_ACTIONS.items()}
     key: CliffordMatrix = (
         (int(matrix[0, 0]), int(matrix[0, 1])),
         (int(matrix[1, 0]), int(matrix[1, 1])),
     )
-    return matrices[key]
+    return CLIFFORD_BY_MATRIX[key]
