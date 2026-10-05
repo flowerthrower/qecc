@@ -148,6 +148,11 @@ def _preserved_low_degree_local_invariant(c1: StabilizerCode, c2: StabilizerCode
 # ----------------------------------------------------------------------------------------------------
 
 
+# --------------------------------------------------
+#   Brute force
+# --------------------------------------------------
+
+
 def _bruteforce_css_code(c: StabilizerCode) -> bool:
     """Check LC equivalence to a CSS code by enumerating local Cliffords."""
     r, n = c.symplectic.shape[0], c.n
@@ -162,6 +167,11 @@ def _bruteforce_css_code(c: StabilizerCode) -> bool:
             return True
 
     return False
+
+
+# --------------------------------------------------
+#   Linear system of equations
+# --------------------------------------------------
 
 
 def _lse_stabilizer_code(c1: StabilizerCode, c2: StabilizerCode) -> list[str] | None:
@@ -199,69 +209,6 @@ def _lse_stabilizer_code(c1: StabilizerCode, c2: StabilizerCode) -> list[str] | 
     return [_canonicalize_clifford(operation) for operation in result[: c1.n]]
 
 
-def _graph_isomorphism_stabilizer_code(c1: StabilizerCode, c2: StabilizerCode) -> list[str] | None:
-    """Check local-Clifford equivalence of stabilizer codes through an isomorphism of the full-group graph encodings."""
-    mapping = _colored_graph_isomorphism(
-        _graph_from_stabilizer_group(c1.symplectic), _graph_from_stabilizer_group(c2.symplectic)
-    )
-
-    if mapping is None:
-        return None
-
-    # The vertices 3q, 3q + 1, and 3q + 2 represent X, Z, and Y on qubit q, i.e., the Paulis with values x + 2z
-    # of 1, 2, and 3. The columns of a Clifford matrix are the (x, z) images of X and Z.
-    operations = []
-    for qubit in range(c1.n):
-        x_image = mapping[3 * qubit] - 3 * qubit + 1
-        z_image = mapping[3 * qubit + 1] - 3 * qubit + 1
-        operations.append(CLIFFORD_BY_MATRIX[(x_image & 1, z_image & 1), (x_image >> 1, z_image >> 1)])
-    return operations
-
-
-def _sat_stabilizer_code(c1: StabilizerCode, c2: StabilizerCode) -> list[str] | None:
-    """Check LC equivalence of two stabilizer codes using a SAT encoding."""
-    solver = z3.Solver()
-
-    r, n = c1.symplectic.shape[0], c1.n
-    aux_tableau = [z3.Bool(f"aux_{row}_{col}") for row in range(r) for col in range(2 * n)]
-    local_clifford_variables = _encode_local_cliffords(solver, c1.symplectic, aux_tableau)
-    _encode_row_operations(solver, aux_tableau, c2.symplectic, variable_prefix="r")
-
-    if solver.check() != z3.sat:
-        return None
-
-    model = solver.model()
-    return [
-        next(
-            operation
-            for operation, variable in qubit_variables.items()
-            if z3.is_true(model.eval(variable, model_completion=True))
-        )
-        for qubit_variables in local_clifford_variables
-    ]
-
-
-def _sat_css_code(c: StabilizerCode) -> bool:
-    """Check LC equivalence to a CSS code using a SAT encoding.
-
-    This encoding is based on the ideas by Dasu and Burton:
-    https://arxiv.org/abs/2507.10519.
-    """
-    solver = z3.Solver()
-
-    r, n = c.symplectic.shape[0], c.n
-    aux_tableau = [z3.Bool(f"aux_{row}_{col}") for row in range(r) for col in range(2 * n)]
-    _encode_local_cliffords(solver, c.symplectic, aux_tableau, project_to_css=True)
-    _encode_row_operations(solver, aux_tableau, c.symplectic, variable_prefix="r")
-
-    return solver.check() == z3.sat
-
-
-# ----------------------------------------------------------------------------------------------------
-#   Helper functions
-# ----------------------------------------------------------------------------------------------------
-
-
 def _stabilizer_code_to_state(code: StabilizerCode) -> npt.NDArray[np.integer]:
     """Extend a stabilizer code to a purified stabilizer state."""
     if code.k == 0:
@@ -286,6 +233,36 @@ def _stabilizer_code_to_state(code: StabilizerCode) -> npt.NDArray[np.integer]:
     logical_x_part = np.hstack([logical_x_x, np.eye(k, dtype=np.int8), logical_x_z, np.zeros((k, k), dtype=np.int8)])
     logical_z_part = np.hstack([logical_z_x, np.zeros((k, k), dtype=np.int8), logical_z_z, np.eye(k, dtype=np.int8)])
     return np.vstack([stabilizer_part, logical_x_part, logical_z_part]).astype(np.int8)
+
+
+def _stabilizer_state_to_graph_state(
+    tableau: npt.NDArray[np.integer],
+) -> tuple[npt.NDArray[np.integer], list[str]]:
+    """Convert a stabilizer state to an LC-equivalent graph state."""
+    state = tableau.copy()
+    n = state.shape[1] // 2
+    operations = [""] * n
+
+    # Make the X part invertible using local Clifford operations
+    _make_x_part_invertible(state, operations)
+
+    # Reduce the X part to the identity and extract the adjacency matrix
+    _, x_rank, transform, _ = row_echelon(state[:, :n], full=True)
+    if x_rank != n:
+        msg = "X part of the tableau is not full rank, something went wrong."
+        raise ValueError(msg)
+    adjacency = ((transform @ state) % 2)[:, n:]
+
+    # Remove self-loops using phase gates
+    for qubit in range(n):
+        if adjacency[qubit, qubit]:
+            operations[qubit] = "S" + operations[qubit]
+            adjacency[qubit, qubit] = 0
+
+    if not np.array_equal(adjacency, adjacency.T):
+        msg = "Extracted adjacency matrix is not symmetric, something went wrong."
+        raise ValueError(msg)
+    return adjacency, operations
 
 
 def _make_x_part_invertible(tableau: npt.NDArray[np.integer], operations: list[str]) -> None:
@@ -330,36 +307,6 @@ def _make_x_part_invertible(tableau: npt.NDArray[np.integer], operations: list[s
 
         if not improved:
             break
-
-
-def _stabilizer_state_to_graph_state(
-    tableau: npt.NDArray[np.integer],
-) -> tuple[npt.NDArray[np.integer], list[str]]:
-    """Convert a stabilizer state to an LC-equivalent graph state."""
-    state = tableau.copy()
-    n = state.shape[1] // 2
-    operations = [""] * n
-
-    # Make the X part invertible using local Clifford operations
-    _make_x_part_invertible(state, operations)
-
-    # Reduce the X part to the identity and extract the adjacency matrix
-    _, x_rank, transform, _ = row_echelon(state[:, :n], full=True)
-    if x_rank != n:
-        msg = "X part of the tableau is not full rank, something went wrong."
-        raise ValueError(msg)
-    adjacency = ((transform @ state) % 2)[:, n:]
-
-    # Remove self-loops using phase gates
-    for qubit in range(n):
-        if adjacency[qubit, qubit]:
-            operations[qubit] = "S" + operations[qubit]
-            adjacency[qubit, qubit] = 0
-
-    if not np.array_equal(adjacency, adjacency.T):
-        msg = "Extracted adjacency matrix is not symmetric, something went wrong."
-        raise ValueError(msg)
-    return adjacency, operations
 
 
 def _locally_equivalent_connected_graphs(
@@ -407,6 +354,30 @@ def _locally_equivalent_connected_graphs(
     return None
 
 
+# --------------------------------------------------
+#   Graph isomorphism
+# --------------------------------------------------
+
+
+def _graph_isomorphism_stabilizer_code(c1: StabilizerCode, c2: StabilizerCode) -> list[str] | None:
+    """Check local-Clifford equivalence of stabilizer codes through an isomorphism of the full-group graph encodings."""
+    mapping = _colored_graph_isomorphism(
+        _graph_from_stabilizer_group(c1.symplectic), _graph_from_stabilizer_group(c2.symplectic)
+    )
+
+    if mapping is None:
+        return None
+
+    # The vertices 3q, 3q + 1, and 3q + 2 represent X, Z, and Y on qubit q, i.e., the Paulis with values x + 2z
+    # of 1, 2, and 3. The columns of a Clifford matrix are the (x, z) images of X and Z.
+    operations = []
+    for qubit in range(c1.n):
+        x_image = mapping[3 * qubit] - 3 * qubit + 1
+        z_image = mapping[3 * qubit + 1] - 3 * qubit + 1
+        operations.append(CLIFFORD_BY_MATRIX[(x_image & 1, z_image & 1), (x_image >> 1, z_image >> 1)])
+    return operations
+
+
 def _graph_from_stabilizer_group(symplectic: npt.NDArray[np.integer]) -> nx.Graph:
     """Build a colored incidence graph of the single-qubit Paulis and the stabilizer group elements."""
     n = symplectic.shape[1] // 2
@@ -425,6 +396,50 @@ def _graph_from_stabilizer_group(symplectic: npt.NDArray[np.integer]) -> nx.Grap
     )
 
     return graph
+
+
+# --------------------------------------------------
+#   SAT
+# --------------------------------------------------
+
+
+def _sat_stabilizer_code(c1: StabilizerCode, c2: StabilizerCode) -> list[str] | None:
+    """Check LC equivalence of two stabilizer codes using a SAT encoding."""
+    solver = z3.Solver()
+
+    r, n = c1.symplectic.shape[0], c1.n
+    aux_tableau = [z3.Bool(f"aux_{row}_{col}") for row in range(r) for col in range(2 * n)]
+    local_clifford_variables = _encode_local_cliffords(solver, c1.symplectic, aux_tableau)
+    _encode_row_operations(solver, aux_tableau, c2.symplectic, variable_prefix="r")
+
+    if solver.check() != z3.sat:
+        return None
+
+    model = solver.model()
+    return [
+        next(
+            operation
+            for operation, variable in qubit_variables.items()
+            if z3.is_true(model.eval(variable, model_completion=True))
+        )
+        for qubit_variables in local_clifford_variables
+    ]
+
+
+def _sat_css_code(c: StabilizerCode) -> bool:
+    """Check LC equivalence to a CSS code using a SAT encoding.
+
+    This encoding is based on the ideas by Dasu and Burton:
+    https://arxiv.org/abs/2507.10519.
+    """
+    solver = z3.Solver()
+
+    r, n = c.symplectic.shape[0], c.n
+    aux_tableau = [z3.Bool(f"aux_{row}_{col}") for row in range(r) for col in range(2 * n)]
+    _encode_local_cliffords(solver, c.symplectic, aux_tableau, project_to_css=True)
+    _encode_row_operations(solver, aux_tableau, c.symplectic, variable_prefix="r")
+
+    return solver.check() == z3.sat
 
 
 def _encode_local_cliffords(

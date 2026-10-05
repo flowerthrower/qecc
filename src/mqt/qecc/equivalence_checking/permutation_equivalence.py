@@ -235,6 +235,11 @@ def _preserved_linear_dependencies(c1: StabilizerCode | CSSCode, c2: StabilizerC
     return _linear_dependencies(c1) == _linear_dependencies(c2)
 
 
+# ----------------------------------------------------------------------------------------------------
+#   Signatures
+# ----------------------------------------------------------------------------------------------------
+
+
 def _preserved_punctured_hull_weight_enumerator_css_code(
     c1: CSSCode, c2: CSSCode
 ) -> tuple[dict[_CSSHullSignature, list[int]], dict[_CSSHullSignature, list[int]]] | None:
@@ -257,6 +262,16 @@ def _preserved_punctured_hull_weight_enumerator_css_code(
     return _matching_invariant_partitions(signatures_c1, signatures_c2)
 
 
+def _binary_punctured_hull_bases(
+    matrix: npt.NDArray[np.integer],
+) -> Iterator[npt.NDArray[np.integer]]:
+    """Yield a binary hull basis for every punctured column of a matrix."""
+    for column in range(matrix.shape[1]):
+        punctured = np.delete(matrix, column, axis=1)
+        gram = (punctured @ punctured.T) & 1
+        yield row_basis((nullspace(gram) @ punctured) & 1).astype(np.uint8)
+
+
 def _preserved_punctured_hull_weight_enumerator_stabilizer_code(
     c1: StabilizerCode, c2: StabilizerCode
 ) -> tuple[dict[tuple[int, ...], list[int]], dict[tuple[int, ...], list[int]]] | None:
@@ -277,9 +292,91 @@ def _preserved_punctured_hull_weight_enumerator_stabilizer_code(
     return _matching_invariant_partitions(signatures_c1, signatures_c2)
 
 
+def _quaternary_punctured_hull_bases(
+    matrix: npt.NDArray[np.integer],
+) -> Iterator[npt.NDArray[np.integer]]:
+    """Yield an additive GF(4) hull basis for every punctured column of a matrix."""
+    num_rows, num_columns = matrix.shape
+    contributions = np.zeros((num_columns, num_rows, num_rows), dtype=np.uint8)
+
+    for column in range(num_columns):
+        x_column = matrix[:, column] & 1
+        z_column = matrix[:, column] >> 1
+        contributions[column] = (x_column[:, None] & z_column[None, :]) ^ (z_column[:, None] & x_column[None, :])
+
+    full_gram = np.bitwise_xor.reduce(contributions, axis=0, initial=0)
+    for column in range(num_columns):
+        punctured = np.delete(matrix, column, axis=1)
+        gram = full_gram ^ contributions[column]
+        yield gf4_row_basis(matmul_gf2_gf4(nullspace(gram.T), punctured))
+
+
+def _punctured_hull_weight_enumerators(
+    hull_bases: Iterator[npt.NDArray[np.integer]],
+    weight: Callable[[npt.NDArray[np.integer]], int],
+    *,
+    max_dimension: int | None = None,
+) -> list[tuple[int, ...]]:
+    """Compute a weight enumerator for each punctured hull basis.
+
+    Hulls exceeding ``max_dimension`` are too large to enumerate and only described by their dimension.
+    """
+    return [
+        (-1, basis.shape[0])
+        if max_dimension is not None and basis.shape[0] > max_dimension
+        else tuple(_gray_code_weight_enumerator(basis, weight))
+        for basis in hull_bases
+    ]
+
+
+def _gray_code_weight_enumerator(
+    basis: npt.NDArray[np.integer], weight: Callable[[npt.NDArray[np.integer]], int]
+) -> list[int]:
+    """Enumerate the weights of a binary row span in Gray-code order."""
+    rows, columns = basis.shape
+    enumerator = [1] + [0] * columns
+    word = np.zeros(columns, dtype=basis.dtype)
+    previous_gray = 0
+
+    for value in range(1, 1 << rows):
+        gray = value ^ (value >> 1)
+        changed = gray ^ previous_gray
+        word ^= basis[changed.bit_length() - 1]
+        enumerator[weight(word)] += 1
+        previous_gray = gray
+
+    return enumerator
+
+
+def _matching_invariant_partitions(
+    invariants1: Sequence[InvariantT], invariants2: Sequence[InvariantT]
+) -> tuple[dict[InvariantT, list[int]], dict[InvariantT, list[int]]] | None:
+    """Build and compare column partitions induced by two invariant sequences."""
+    partition1 = _partition_columns_by_invariants(invariants1)
+    partition2 = _partition_columns_by_invariants(invariants2)
+
+    if partition1.keys() != partition2.keys():
+        return None
+    if any(len(partition1[invariant]) != len(partition2[invariant]) for invariant in partition1):
+        return None
+    return partition1, partition2
+
+
+def _partition_columns_by_invariants(invariants: Sequence[InvariantT]) -> dict[InvariantT, list[int]]:
+    """Partition column indices by invariant value."""
+    partition: defaultdict[InvariantT, list[int]] = defaultdict(list)
+    for index, invariant in enumerate(invariants):
+        partition[invariant].append(index)
+    return dict(sorted(partition.items(), key=operator.itemgetter(0)))
+
+
 # ----------------------------------------------------------------------------------------------------
 #   Decision procedures
 # ----------------------------------------------------------------------------------------------------
+
+# --------------------------------------------------
+#   Brute force
+# --------------------------------------------------
 
 
 def _bruteforce_css(c1: CSSCode, c2: CSSCode) -> list[int] | None:
@@ -297,85 +394,9 @@ def _bruteforce_css(c1: CSSCode, c2: CSSCode) -> list[int] | None:
     return None
 
 
-def _graph_isomorphism_stabilizer_code(
-    c1: StabilizerCode,
-    partition1: Mapping[InvariantT, Sequence[int]],
-    c2: StabilizerCode,
-    partition2: Mapping[InvariantT, Sequence[int]],
-) -> list[int] | None:
-    """Check permutation equivalence of stabilizer codes through an isomorphism of the full-group graph encodings."""
-    mapping = _colored_graph_isomorphism(
-        _graph_from_stabilizer_group_and_invariants(c1.symplectic, partition1),
-        _graph_from_stabilizer_group_and_invariants(c2.symplectic, partition2),
-        edge_colors=True,
-    )
-
-    if mapping is None:
-        return None
-
-    return [mapping[q] for q in range(c1.n)]
-
-
-def _sat_stabilizer_code(
-    c1: StabilizerCode,
-    partition1: dict[tuple[int, ...], list[int]],
-    c2: StabilizerCode,
-    partition2: dict[tuple[int, ...], list[int]],
-) -> list[int] | None:
-    """Check permutation equivalence of stabilizer codes using a SAT encoding."""
-    solver = z3.Solver()
-
-    r, n = c1.symplectic.shape[0], c1.n
-
-    auxiliary_x = [z3.Bool(f"aux_x_{row}_{column}") for row in range(r) for column in range(n)]
-    auxiliary_z = [z3.Bool(f"aux_z_{row}_{column}") for row in range(r) for column in range(n)]
-    permutation_variables = _encode_permutation(solver, n, partition1, partition2)
-    _encode_permutation_implications(
-        solver,
-        permutation_variables,
-        c1.symplectic[:, :n],
-        c1.symplectic[:, n:],
-        auxiliary_x,
-        auxiliary_z,
-    )
-
-    auxiliary_tableau = [
-        auxiliary_x[row * n + column] if column < n else auxiliary_z[row * n + column - n]
-        for row in range(r)
-        for column in range(2 * n)
-    ]
-    _encode_row_operations(solver, auxiliary_tableau, c2.symplectic, variable_prefix="r")
-
-    if solver.check() != z3.sat:
-        return None
-
-    return _extract_permutation(solver.model(), n, permutation_variables)
-
-
-def _sat_css_code(
-    c1: CSSCode,
-    partition1: Mapping[InvariantT, Sequence[int]],
-    c2: CSSCode,
-    partition2: Mapping[InvariantT, Sequence[int]],
-) -> list[int] | None:
-    """Check permutation equivalence of CSS codes using a SAT encoding."""
-    solver = z3.Solver()
-
-    n = c1.n
-    rx = c1.Hx.shape[0]
-    rz = c1.Hz.shape[0]
-
-    auxiliary_x = [z3.Bool(f"aux_x_{row}_{column}") for row in range(rx) for column in range(n)]
-    auxiliary_z = [z3.Bool(f"aux_z_{row}_{column}") for row in range(rz) for column in range(n)]
-    permutation_variables = _encode_permutation(solver, n, partition1, partition2)
-    _encode_permutation_implications(solver, permutation_variables, c1.Hx, c1.Hz, auxiliary_x, auxiliary_z)
-    _encode_row_operations(solver, auxiliary_x, c2.Hx, variable_prefix="r_x")
-    _encode_row_operations(solver, auxiliary_z, c2.Hz, variable_prefix="r_z")
-
-    if solver.check() != z3.sat:
-        return None
-
-    return _extract_permutation(solver.model(), n, permutation_variables)
+# --------------------------------------------------
+#   Matroid isomorphism
+# --------------------------------------------------
 
 
 def _matroid_css_code(
@@ -418,11 +439,6 @@ def _matroid_css_code(
         return None
 
     return [mapping[q] for q in range(n)]
-
-
-# ----------------------------------------------------------------------------------------------------
-#   Helper functions
-# ----------------------------------------------------------------------------------------------------
 
 
 def _circuits_binary_matroid(matrix: npt.NDArray[np.integer]) -> list[int]:
@@ -486,6 +502,30 @@ def _graph_from_circuits_and_invariants(
     return graph
 
 
+# --------------------------------------------------
+#   Graph isomorphism
+# --------------------------------------------------
+
+
+def _graph_isomorphism_stabilizer_code(
+    c1: StabilizerCode,
+    partition1: Mapping[InvariantT, Sequence[int]],
+    c2: StabilizerCode,
+    partition2: Mapping[InvariantT, Sequence[int]],
+) -> list[int] | None:
+    """Check permutation equivalence of stabilizer codes through an isomorphism of the full-group graph encodings."""
+    mapping = _colored_graph_isomorphism(
+        _graph_from_stabilizer_group_and_invariants(c1.symplectic, partition1),
+        _graph_from_stabilizer_group_and_invariants(c2.symplectic, partition2),
+        edge_colors=True,
+    )
+
+    if mapping is None:
+        return None
+
+    return [mapping[q] for q in range(c1.n)]
+
+
 def _graph_from_stabilizer_group_and_invariants(
     symplectic: npt.NDArray[np.integer],
     partition: Mapping[InvariantT, Sequence[int]],
@@ -516,92 +556,71 @@ def _color_qubits(graph: nx.Graph, partition: Mapping[InvariantT, Sequence[int]]
             graph.nodes[column]["color"] = ("qubit", color)
 
 
-def _binary_punctured_hull_bases(
-    matrix: npt.NDArray[np.integer],
-) -> Iterator[npt.NDArray[np.integer]]:
-    """Yield a binary hull basis for every punctured column of a matrix."""
-    for column in range(matrix.shape[1]):
-        punctured = np.delete(matrix, column, axis=1)
-        gram = (punctured @ punctured.T) & 1
-        yield row_basis((nullspace(gram) @ punctured) & 1).astype(np.uint8)
+# --------------------------------------------------
+#   SAT
+# --------------------------------------------------
 
 
-def _quaternary_punctured_hull_bases(
-    matrix: npt.NDArray[np.integer],
-) -> Iterator[npt.NDArray[np.integer]]:
-    """Yield an additive GF(4) hull basis for every punctured column of a matrix."""
-    num_rows, num_columns = matrix.shape
-    contributions = np.zeros((num_columns, num_rows, num_rows), dtype=np.uint8)
+def _sat_css_code(
+    c1: CSSCode,
+    partition1: Mapping[InvariantT, Sequence[int]],
+    c2: CSSCode,
+    partition2: Mapping[InvariantT, Sequence[int]],
+) -> list[int] | None:
+    """Check permutation equivalence of CSS codes using a SAT encoding."""
+    solver = z3.Solver()
 
-    for column in range(num_columns):
-        x_column = matrix[:, column] & 1
-        z_column = matrix[:, column] >> 1
-        contributions[column] = (x_column[:, None] & z_column[None, :]) ^ (z_column[:, None] & x_column[None, :])
+    n = c1.n
+    rx = c1.Hx.shape[0]
+    rz = c1.Hz.shape[0]
 
-    full_gram = np.bitwise_xor.reduce(contributions, axis=0, initial=0)
-    for column in range(num_columns):
-        punctured = np.delete(matrix, column, axis=1)
-        gram = full_gram ^ contributions[column]
-        yield gf4_row_basis(matmul_gf2_gf4(nullspace(gram.T), punctured))
+    auxiliary_x = [z3.Bool(f"aux_x_{row}_{column}") for row in range(rx) for column in range(n)]
+    auxiliary_z = [z3.Bool(f"aux_z_{row}_{column}") for row in range(rz) for column in range(n)]
+    permutation_variables = _encode_permutation(solver, n, partition1, partition2)
+    _encode_permutation_implications(solver, permutation_variables, c1.Hx, c1.Hz, auxiliary_x, auxiliary_z)
+    _encode_row_operations(solver, auxiliary_x, c2.Hx, variable_prefix="r_x")
+    _encode_row_operations(solver, auxiliary_z, c2.Hz, variable_prefix="r_z")
+
+    if solver.check() != z3.sat:
+        return None
+
+    return _extract_permutation(solver.model(), n, permutation_variables)
 
 
-def _punctured_hull_weight_enumerators(
-    hull_bases: Iterator[npt.NDArray[np.integer]],
-    weight: Callable[[npt.NDArray[np.integer]], int],
-    *,
-    max_dimension: int | None = None,
-) -> list[tuple[int, ...]]:
-    """Compute a weight enumerator for each punctured hull basis.
+def _sat_stabilizer_code(
+    c1: StabilizerCode,
+    partition1: dict[tuple[int, ...], list[int]],
+    c2: StabilizerCode,
+    partition2: dict[tuple[int, ...], list[int]],
+) -> list[int] | None:
+    """Check permutation equivalence of stabilizer codes using a SAT encoding."""
+    solver = z3.Solver()
 
-    Hulls exceeding ``max_dimension`` are too large to enumerate and only described by their dimension.
-    """
-    return [
-        (-1, basis.shape[0])
-        if max_dimension is not None and basis.shape[0] > max_dimension
-        else tuple(_gray_code_weight_enumerator(basis, weight))
-        for basis in hull_bases
+    r, n = c1.symplectic.shape[0], c1.n
+
+    auxiliary_x = [z3.Bool(f"aux_x_{row}_{column}") for row in range(r) for column in range(n)]
+    auxiliary_z = [z3.Bool(f"aux_z_{row}_{column}") for row in range(r) for column in range(n)]
+    permutation_variables = _encode_permutation(solver, n, partition1, partition2)
+    _encode_permutation_implications(
+        solver,
+        permutation_variables,
+        c1.symplectic[:, :n],
+        c1.symplectic[:, n:],
+        auxiliary_x,
+        auxiliary_z,
+    )
+
+    auxiliary_tableau = [
+        auxiliary_x[row * n + column] if column < n else auxiliary_z[row * n + column - n]
+        for row in range(r)
+        for column in range(2 * n)
     ]
+    _encode_row_operations(solver, auxiliary_tableau, c2.symplectic, variable_prefix="r")
 
-
-def _matching_invariant_partitions(
-    invariants1: Sequence[InvariantT], invariants2: Sequence[InvariantT]
-) -> tuple[dict[InvariantT, list[int]], dict[InvariantT, list[int]]] | None:
-    """Build and compare column partitions induced by two invariant sequences."""
-    partition1 = _partition_columns_by_invariants(invariants1)
-    partition2 = _partition_columns_by_invariants(invariants2)
-
-    if partition1.keys() != partition2.keys():
+    if solver.check() != z3.sat:
         return None
-    if any(len(partition1[invariant]) != len(partition2[invariant]) for invariant in partition1):
-        return None
-    return partition1, partition2
 
-
-def _partition_columns_by_invariants(invariants: Sequence[InvariantT]) -> dict[InvariantT, list[int]]:
-    """Partition column indices by invariant value."""
-    partition: defaultdict[InvariantT, list[int]] = defaultdict(list)
-    for index, invariant in enumerate(invariants):
-        partition[invariant].append(index)
-    return dict(sorted(partition.items(), key=operator.itemgetter(0)))
-
-
-def _gray_code_weight_enumerator(
-    basis: npt.NDArray[np.integer], weight: Callable[[npt.NDArray[np.integer]], int]
-) -> list[int]:
-    """Enumerate the weights of a binary row span in Gray-code order."""
-    rows, columns = basis.shape
-    enumerator = [1] + [0] * columns
-    word = np.zeros(columns, dtype=basis.dtype)
-    previous_gray = 0
-
-    for value in range(1, 1 << rows):
-        gray = value ^ (value >> 1)
-        changed = gray ^ previous_gray
-        word ^= basis[changed.bit_length() - 1]
-        enumerator[weight(word)] += 1
-        previous_gray = gray
-
-    return enumerator
+    return _extract_permutation(solver.model(), n, permutation_variables)
 
 
 def _encode_permutation(
